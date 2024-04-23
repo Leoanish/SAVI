@@ -1,0 +1,247 @@
+---
+title: "SAVI"
+format: html
+editor: visual
+---
+
+```{r}
+library(sf)
+library(tidyverse)
+library(dplyr)
+library(janitor)
+library(ggplot2)
+library(stars)
+library(mapview)
+library(factoextra)
+library(shadowtext)
+library(purrr)
+library(raster)
+library(mapedit)
+library(mapview)
+library(rpart)
+library(rpart.plot)
+library(forcats)
+library(rasterVis)
+library(terra)
+library(caret)
+library(progressr)
+```
+
+```{r}
+midville_info <- read_csv("../data/info_mid_all_rates.csv") %>% 
+  rename(plot = "plot_ids")
+```
+
+```{r}
+nir_07_14 <- read_stars("../data/mid_07_14.tif")
+
+red_07_14 <- read_stars("../data/07_14_mid_noalpha_reflectance_red_1_1.tif")
+
+blue_07_14 <- read_stars("../data/07_14_mid_noalpha_reflectance_blue_1_1.tif")
+
+rededge_07_14 <- read_stars("../data/07_14_mid_noalpha_reflectance_red edge_1_1.tif")
+
+four_bands <- c(nir_07_14, red_07_14, blue_07_14, rededge_07_14)
+
+# blue_07_14 <- read_stars("../data/Blue tiles/07_14_mid_noalpha_reflectance_blue_1_1.tif")
+
+# st_crs(blue_07_14)
+```
+
+```{r}
+# ndre_07_14 <- (nir_07_14 - re_07_14)/(nir_07_14 + re_07_14) # Calculating NDRE 
+```
+
+# plot polygon
+
+```{r}
+plot_07_14 <- read_sf("../data/plots 07_14/plots 07_14.shp") %>% 
+  st_transform(crs = st_crs(four_bands))
+
+field_07_14 <- read_sf("../data/field shape file/field midville.shp") %>% 
+  st_transform(crs = st_crs(four_bands))
+
+```
+
+
+```{r}
+cropped_07_14 <- st_crop(four_bands, field_07_14) %>% 
+  rename(layer = mid_07_14.tif) # Shrinking down to field for faster processing
+
+clustering <- cropped_07_14 %>% 
+  st_as_sf() %>% 
+  rename(nir = colnames(.[1])) %>% 
+  rename(red = colnames(.[2])) %>% 
+  rename(blue = colnames(.[3])) %>% 
+  rename(red_edge = colnames(.[4])) %>% 
+  mutate(across(c("nir1", `red1`, `blue1`, "red_edge1"), ~scale(.), .names = "{.col}_s"))
+  
+  # mutate(nir_s = scale(nir1),
+  #        red_s = scale(red1),
+  #        blue_s = scale(blue1),
+  #        red_edge_s = scale(red_edge))
+
+cropped_07_14 %>% 
+  st_as_sf() %>% 
+  rename(nir = colnames(.[1])) %>% 
+  rename(red = colnames(.[2])) %>% 
+  rename(blue = colnames(.[3])) %>% 
+  mutate(across(c("nir1", `red1`, `blue1`), ~scale(.), .names = "{.col}_s"))
+```
+
+```{r}
+set.seed(999)
+
+to_clust_df <- clustering %>% 
+  dplyr::select(6,7,8,9) %>% 
+  st_drop_geometry()
+
+clustered <- kmeans(to_clust_df, nstart = 25, iter.max = 5, centers = 6, algorithm = "MacQueen")
+
+clustered$cluster
+```
+
+```{r}
+clustered_df <- clustering %>% 
+  cbind(clusters = clustered$cluster) %>% 
+  mutate(type = case_when(
+    clusters %in% c(1,5) ~ "plant",
+    clusters %in% c(2,3,4,6) ~ "soils"
+  ))
+```
+
+```{r}
+ggplot()+
+  geom_sf(data = clustered_df, aes(color = factor(clusters)))+
+  # scale_color_manual(values = c("forestgreen", "burlywood"))
+  scale_color_manual(values = c("red", "yellow", "burlywood", "darkgreen", "white", "purple"))
+```
+
+```{r}
+w_plots <- st_intersection(plot_07_14, clustered_df) %>% 
+  group_by(plot) %>% 
+  mutate(total_px = n()) %>% 
+  ungroup() %>% 
+  group_by(type, plot) %>% 
+  mutate(type_px = n()) %>% 
+  ungroup()
+```
+
+```{r}
+savi_calc <- w_plots %>% 
+  mutate(pct = type_px/total_px * 100) %>% 
+  st_drop_geometry() %>% 
+  group_by(plot, type) %>% 
+  summarise(across(c("nir1":"clusters", "pct"), ~mean(.), .names = "{.col}_avg")) %>% 
+  mutate(savi = (1+pct_avg/100)*((nir1_avg - red1_avg)/(nir1_avg + red1_avg + pct_avg/100))) %>% 
+  ungroup() %>% 
+  left_join(midville_info, by = "plot")%>% 
+  mutate(ndvi = (nir1_avg - red1_avg)/(nir1_avg + red1_avg),
+         osavi = (nir1_avg - red1_avg)/(nir1_avg + red1_avg + 0.16),
+         ndre = (nir1_avg - red_edge1_avg)/(nir1_avg + red_edge1_avg))
+  
+```
+
+```{r}
+ndvi_plants <- savi_calc %>% 
+  filter(type == "plant") %>% 
+  dplyr::select(plot, type, blocks, treatment, ndvi, pp_lbac)
+
+savi <- savi_calc %>% 
+  filter(type == "soils") %>% 
+  dplyr::select(plot, savi)
+
+ndvi_ps <- savi_calc %>% 
+  group_by(plot) %>% 
+  summarise(ndvi_overall = mean(ndvi))
+
+osavi_plants <- savi_calc %>% 
+  filter(type =="plant") %>% 
+  dplyr::select(plot, osavi)
+
+osavi_ps <- savi_calc %>% 
+  group_by(plot) %>% 
+  summarise(osavi_overall = mean(osavi))
+
+ndre_plants <- savi_calc %>% 
+  filter(type =="plant") %>% 
+  dplyr::select(plot, ndre)
+
+ndre_overall <- savi_calc %>% 
+  group_by(plot) %>% 
+  summarise(ndre_overall = mean(ndre))
+```
+
+```{r}
+all_vis <- purrr::reduce(list(ndvi_plants, savi, ndvi_ps, osavi_ps, ndre_plants, ndre_overall), left_join, by = "plot")
+
+with_ref <- all_vis %>% 
+  group_by(blocks) %>% 
+  mutate(across("ndvi":"ndre_overall", ~quantile(.,0.95), .names = "{col}_ref")) %>% 
+  ungroup()
+
+```
+
+```{r}
+with_si <- with_ref %>% 
+  mutate(nopt = 75,
+         si_ndvi = ndvi/ndvi_ref,
+         si_savi = savi/savi_ref,
+         si_ndvi_overall = ndvi_overall/ndvi_overall_ref,
+         si_osavi_overall = osavi_overall/osavi_overall_ref,
+         si_ndre = ndre/ndre_ref,
+         si_ndre_overall = ndre_overall/ndre_overall_ref) 
+  
+```
+
+```{r}
+nested_df <- with_si %>% 
+  dplyr::select(nopt:si_ndre_overall, pp_lbac, blocks, treatment) %>% 
+  pivot_longer(cols = si_ndvi:si_ndre_overall) %>% 
+  group_by(name) %>% 
+  nest() %>% 
+  mutate(rec_rate = map(data,
+                        ~((.x$nopt - .x$pp_lbac)*(sqrt((1-.x$value)/0.3))))) %>% 
+  unnest(rec_rate, data)
+
+nested_df %>% 
+  filter(grepl("VRN", treatment))
+
+
+```
+
+```{r}
+trt_rec_rate <- nested_df %>% 
+  mutate(rec_rate = ifelse(is.na(rec_rate), 0, rec_rate)) %>% 
+  group_by(name, treatment) %>% 
+  summarise(avg_rec_rate = mean(rec_rate))
+
+trt_rec_rate %>% 
+  filter(grepl("VRN", treatment))
+```
+
+```{r, fig.height=6, fig.width=9}
+trt_rec_rate %>% 
+  ggplot()+
+  geom_col(aes(x = treatment, y = avg_rec_rate, fill = name), position = "dodge", color = "black") +
+  scale_fill_manual(values = c("red", "darkred", "green", "forestgreen", "yellow", "darkblue"),
+                    labels = c("NDRE (only plants)",
+                               "NDRE (plant + soils)",
+                               "NDVI (only plants)",
+                               "NDVI (plant + soil)",
+                               "OSAVI (plant + soil)",
+                               "SAVI (plant + soil)"),
+                    name = "Recommended N rate for VIs")+
+  labs(y = "Recommended N rate (kg/ha)",
+       x = "Treatments")+
+  theme(legend.position = c(0.87,0.83),
+        panel.background = element_rect(fill = "gray80"),
+        panel.grid = element_blank())
+
+
+ggsave("../output/VIs_recommended rate.png",
+       dpi = 600,
+       height = 6,
+       width = 9)
+```
+
